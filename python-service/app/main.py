@@ -6,5 +6,5 @@ app = FastAPI(title="Log Anomaly Detection Service")
 
 @app.post("/predict", response_model=LogResponse)
 def predict(request: LogRequest):
-    result = predict_log(request.text)
+    result = predict_log(request.text, threshold=0.1)
     return LogResponse(label=result["label"], score=result["score"])

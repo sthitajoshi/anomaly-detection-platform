@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -49,7 +51,7 @@ type pyPredictResponse struct {
 var httpClient = &http.Client{Timeout: 5 * time.Second}
 
 func pythonURL() string {
-	return getEnv("PYTHON_SERVICE_URL", "http://localhost:8000/predict")
+	return getEnv("PYTHON_SERVICE_URL", "http://localhost:8001/predict")
 }
 
 func callPythonPredict(ctx context.Context, text string) (label string, score float64, err error) {
@@ -68,9 +70,11 @@ func callPythonPredict(ctx context.Context, text string) (label string, score fl
 		return "", 0, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", 0, fmtErrorStatus(resp.StatusCode)
 	}
+
 	var out pyPredictResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", 0, err
@@ -115,7 +119,6 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -128,51 +131,72 @@ func main() {
 }
 
 // logsHandler accepts either application/json with {text, metadata}
-// or raw text in the request body (text/plain or any other content-type)
+// (single object, array, or NDJSON lines) or raw text bodies.
 func logsHandler(c *gin.Context) {
 	ct := c.GetHeader("Content-Type")
 
-	if hasPrefix(ct, "application/json") {
-		var req LogRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON or missing 'text'"})
+	if strings.HasPrefix(ct, "application/json") {
+		// Read once for multiple parsing strategies
+		b, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "could not read body"})
 			return
 		}
-		resp := LogResponse{
-			Accepted:      true,
-			Text:          req.Text,
-			ContentType:   "application/json",
-			Metadata:      req.Metadata,
-			ReceivedAtUTC: time.Now().UTC(),
+
+		// Try single JSON object
+		var single LogRequest
+		if err := json.Unmarshal(b, &single); err == nil && single.Text != "" {
+			respondWithPrediction(c, ct, single.Text, single.Metadata)
+			return
 		}
-		// Call Python inference (best-effort)
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 4*time.Second)
-		label, score, err := callPythonPredict(ctx, req.Text)
-		cancel()
-		if err == nil {
-			resp.Label = label
-			resp.Score = score
-		} else {
-			log.Printf("python inference error: %v", err)
+
+		// Try JSON array of objects
+		var arr []LogRequest
+		if err := json.Unmarshal(b, &arr); err == nil && len(arr) > 0 {
+			first := arr[0]
+			if first.Text == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "first array item missing 'text'"})
+				return
+			}
+			respondWithPrediction(c, ct, first.Text, first.Metadata)
+			return
 		}
-		c.JSON(http.StatusOK, resp)
+
+		// Try NDJSON (json_stream)
+		for _, ln := range strings.Split(string(b), "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" {
+				continue
+			}
+			var it LogRequest
+			if err := json.Unmarshal([]byte(ln), &it); err == nil && it.Text != "" {
+				respondWithPrediction(c, ct, it.Text, it.Metadata)
+				return
+			}
+		}
+
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON or missing 'text'"})
 		return
 	}
 
-	// Treat as raw text for any non-JSON content-type
+	// Raw text fallback
 	b, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "could not read body"})
 		return
 	}
 	text := string(b)
+	respondWithPrediction(c, ct, text, nil)
+}
+
+// Helper to call Python and build response
+func respondWithPrediction(c *gin.Context, contentType, text string, meta map[string]interface{}) {
 	resp := LogResponse{
-		Accepted:      true,
 		Text:          text,
-		ContentType:   firstNonEmpty(ct, "text/plain"),
+		ContentType:   firstNonEmpty(contentType, "text/plain"),
+		Metadata:      meta,
 		ReceivedAtUTC: time.Now().UTC(),
 	}
-	// Call Python inference (best-effort)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 4*time.Second)
 	label, score, err := callPythonPredict(ctx, text)
 	cancel()
@@ -185,10 +209,7 @@ func logsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func hasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
-}
-
+// Utility helpers
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
@@ -212,4 +233,6 @@ func fmtErrorStatus(code int) error {
 
 type statusError struct{ Code int }
 
-func (e *statusError) Error() string { return "unexpected status: " + http.StatusText(e.Code) }
+func (e *statusError) Error() string {
+	return fmt.Sprintf("unexpected status %d: %s", e.Code, http.StatusText(e.Code))
+}
