@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,7 +27,6 @@ type LogRequest struct {
 }
 
 // LogResponse is the normalized response we return
-// Extend this later to call the Python AI service
 type LogResponse struct {
 	Accepted      bool                   `json:"accepted"`
 	Text          string                 `json:"text"`
@@ -37,8 +38,6 @@ type LogResponse struct {
 }
 
 // Python inference DTOs
-// POST /predict expects: {"text":"..."}
-// Responds: {"label":"...","score":0.97}
 type pyPredictRequest struct {
 	Text string `json:"text"`
 }
@@ -85,7 +84,6 @@ func callPythonPredict(ctx context.Context, text string) (label string, score fl
 func main() {
 	port := getEnv("PORT", "8080")
 
-	// Set Gin mode from ENV if needed (release/debug)
 	if getEnv("GIN_MODE", "") != "" {
 		gin.SetMode(os.Getenv("GIN_MODE"))
 	}
@@ -103,7 +101,6 @@ func main() {
 		v1.POST("/logs", logsHandler)
 	}
 
-	// Build HTTP server to support graceful shutdown
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      r,
@@ -130,39 +127,33 @@ func main() {
 	log.Println("server stopped")
 }
 
-// logsHandler accepts either application/json with {text, metadata}
-// (single object, array, or NDJSON lines) or raw text bodies.
+// logsHandler accepts JSON (object, array, or NDJSON) or raw text.
 func logsHandler(c *gin.Context) {
 	ct := c.GetHeader("Content-Type")
 
 	if strings.HasPrefix(ct, "application/json") {
-		// Read once for multiple parsing strategies
 		b, err := io.ReadAll(c.Request.Body)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "could not read body"})
 			return
 		}
 
-		// Try single JSON object
+		// Try single object
 		var single LogRequest
 		if err := json.Unmarshal(b, &single); err == nil && single.Text != "" {
-			respondWithPrediction(c, ct, single.Text, single.Metadata)
+			respondBatch(c, "structured", []LogRequest{single})
 			return
 		}
 
-		// Try JSON array of objects
+		// Try array of objects
 		var arr []LogRequest
 		if err := json.Unmarshal(b, &arr); err == nil && len(arr) > 0 {
-			first := arr[0]
-			if first.Text == "" {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "first array item missing 'text'"})
-				return
-			}
-			respondWithPrediction(c, ct, first.Text, first.Metadata)
+			respondBatch(c, "structured", arr)
 			return
 		}
 
-		// Try NDJSON (json_stream)
+		// Try NDJSON
+		var ndjson []LogRequest
 		for _, ln := range strings.Split(string(b), "\n") {
 			ln = strings.TrimSpace(ln)
 			if ln == "" {
@@ -170,9 +161,12 @@ func logsHandler(c *gin.Context) {
 			}
 			var it LogRequest
 			if err := json.Unmarshal([]byte(ln), &it); err == nil && it.Text != "" {
-				respondWithPrediction(c, ct, it.Text, it.Metadata)
-				return
+				ndjson = append(ndjson, it)
 			}
+		}
+		if len(ndjson) > 0 {
+			respondBatch(c, "structured", ndjson)
+			return
 		}
 
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON or missing 'text'"})
@@ -186,30 +180,78 @@ func logsHandler(c *gin.Context) {
 		return
 	}
 	text := string(b)
-	respondWithPrediction(c, ct, text, nil)
+	respondBatch(c, "unstructured", []LogRequest{{Text: text}})
 }
 
-// Helper to call Python and build response
-func respondWithPrediction(c *gin.Context, contentType, text string, meta map[string]interface{}) {
-	resp := LogResponse{
-		Text:          text,
-		ContentType:   firstNonEmpty(contentType, "text/plain"),
-		Metadata:      meta,
-		ReceivedAtUTC: time.Now().UTC(),
+// respondBatch handles single or multiple log requests concurrently
+func respondBatch(c *gin.Context, contentType string, logs []LogRequest) {
+	results := make([]LogResponse, len(logs))
+	ctx := c.Request.Context()
+
+	var wg sync.WaitGroup
+	wg.Add(len(logs))
+
+	for i, logReq := range logs {
+		go func(i int, lr LogRequest) {
+			defer wg.Done()
+
+			// Clean/preprocess log text
+			cleaned := preprocessLogText(lr.Text)
+
+			resp := LogResponse{
+				Accepted:      true,
+				Text:          cleaned,
+				ContentType:   contentType,
+				Metadata:      lr.Metadata,
+				ReceivedAtUTC: time.Now().UTC(),
+			}
+
+			// Call Python with timeout
+			cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+			defer cancel()
+			if label, score, err := callPythonPredict(cctx, cleaned); err == nil {
+				resp.Label = label
+				resp.Score = score
+			} else {
+				log.Printf("python inference error: %v", err)
+			}
+			results[i] = resp
+		}(i, logReq)
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 4*time.Second)
-	label, score, err := callPythonPredict(ctx, text)
-	cancel()
-	if err == nil {
-		resp.Label = label
-		resp.Score = score
+
+	wg.Wait()
+
+	if len(results) == 1 {
+		c.JSON(http.StatusOK, results[0]) // backward compat
 	} else {
-		log.Printf("python inference error: %v", err)
+		c.JSON(http.StatusOK, results)
 	}
-	c.JSON(http.StatusOK, resp)
 }
 
-// Utility helpers
+// --- Preprocessing function ---
+func preprocessLogText(input string) string {
+	// Remove timestamps like [2025-09-29 12:00:00]
+	reTime := regexp.MustCompile(`\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]`)
+	cleaned := reTime.ReplaceAllString(input, "")
+
+	// Remove IP addresses
+	reIP := regexp.MustCompile(`\b\d{1,3}(\.\d{1,3}){3}\b`)
+	cleaned = reIP.ReplaceAllString(cleaned, "[REDACTED_IP]")
+
+	// Collapse multiple spaces
+	reSpace := regexp.MustCompile(`\s+`)
+	cleaned = reSpace.ReplaceAllString(cleaned, " ")
+
+	// Trim leading/trailing spaces
+	cleaned = strings.TrimSpace(cleaned)
+
+	// Normalize to lower case
+	cleaned = strings.ToLower(cleaned)
+
+	return cleaned
+}
+
+// --- Utility helpers ---
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
@@ -226,7 +268,6 @@ func getEnv(key, def string) string {
 	return def
 }
 
-// helper to format non-2xx status as error
 func fmtErrorStatus(code int) error {
 	return &statusError{Code: code}
 }
