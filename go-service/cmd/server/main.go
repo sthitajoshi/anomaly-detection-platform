@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"anomaly-detection-platform/go-service/internal/api"
+	"anomaly-detection-platform/go-service/internal/elastic"
 	"anomaly-detection-platform/go-service/pkg/config"
 )
 
@@ -20,6 +22,26 @@ func main() {
 
 	if mode := config.GetEnv("GIN_MODE", ""); mode != "" {
 		gin.SetMode(mode)
+	}
+
+	// Initialize Elasticsearch client
+	esAddresses := strings.Split(config.GetEnv("ELASTICSEARCH_URLS", "http://localhost:9200"), ",")
+	esClient, err := elastic.NewClient(esAddresses)
+	if err != nil {
+		log.Printf("Warning: Failed to connect to Elasticsearch: %v", err)
+		log.Println("Continuing without Elasticsearch - logs will not be stored")
+	} else {
+		log.Println("Connected to Elasticsearch successfully")
+
+		// Create index if it doesn't exist
+		if err := esClient.CreateIndex(context.Background()); err != nil {
+			log.Printf("Warning: Failed to create Elasticsearch index: %v", err)
+		} else {
+			log.Println("Elasticsearch index created/verified successfully")
+		}
+
+		// Set global client
+		api.ESClient = esClient
 	}
 
 	r := gin.New()
