@@ -50,7 +50,9 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./grafana/dashboards.json:/etc/grafana/provisioning/dashboards/dashboards.json
+      - ./grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      - ./grafana/dashboards/:/var/lib/grafana/dashboards
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     networks:
@@ -78,6 +80,17 @@ services:
     container_name: python-service
     ports:
       - "8000:8000"
+    networks:
+      - anomaly-detection
+
+  fluent-bit:
+    image: fluent/fluent-bit:2.2
+    container_name: fluent-bit
+    depends_on:
+      - go-service
+    volumes:
+      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
     networks:
       - anomaly-detection
 

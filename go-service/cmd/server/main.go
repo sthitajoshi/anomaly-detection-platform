@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"anomaly-detection-platform/go-service/internal/api"
+	"anomaly-detection-platform/go-service/internal/metrics"
 	"anomaly-detection-platform/go-service/internal/elastic"
 	"anomaly-detection-platform/go-service/pkg/config"
 )
@@ -44,8 +46,14 @@ func main() {
 		api.ESClient = esClient
 	}
 
+	// Initialize Prometheus metrics
+	metrics.Init()
+
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
+
+	// Expose Prometheus metrics endpoint
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Register API routes
 	api.RegisterRoutes(r)
@@ -77,3 +85,4 @@ func main() {
 	}
 	log.Println("server stopped")
 }
+

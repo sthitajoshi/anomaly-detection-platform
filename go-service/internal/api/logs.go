@@ -13,6 +13,7 @@ import (
 
 	"anomaly-detection-platform/go-service/internal/client"
 	"anomaly-detection-platform/go-service/internal/elastic"
+	"anomaly-detection-platform/go-service/internal/metrics"
 	"anomaly-detection-platform/go-service/internal/preprocessing"
 	"anomaly-detection-platform/go-service/pkg/config"
 )
@@ -100,6 +101,7 @@ func respondBatch(c *gin.Context, contentType string, logs []LogRequest) {
 	for i, logReq := range logs {
 		go func(i int, lr LogRequest) {
 			defer wg.Done()
+			start := time.Now()
 
 			cleaned := preprocessing.PreprocessLogText(lr.Text)
 
@@ -118,11 +120,11 @@ func respondBatch(c *gin.Context, contentType string, logs []LogRequest) {
 				resp.Score = score
 			}
 
+			// Determine anomaly from ML result regardless of Elasticsearch availability
+			isAnomaly := resp.Label == "anomaly" || resp.Score > 0.5
+
 			// Store in Elasticsearch if client is available
 			if ESClient != nil {
-				// Determine if this is an anomaly based on ML prediction
-				isAnomaly := resp.Label == "anomaly" || resp.Score > 0.5
-
 				doc := &elastic.LogDocument{
 					ID:        fmt.Sprintf("%d", time.Now().UnixNano()+int64(i)), // Simple ID generation
 					Timestamp: resp.ReceivedAtUTC,
@@ -135,6 +137,13 @@ func respondBatch(c *gin.Context, contentType string, logs []LogRequest) {
 					fmt.Printf("Failed to index log in Elasticsearch: %v\n", err)
 				}
 			}
+
+			// Prometheus metrics
+			metrics.LogsProcessedTotal.WithLabelValues(contentType).Inc()
+			if isAnomaly {
+				metrics.AnomaliesTotal.WithLabelValues(contentType).Inc()
+			}
+			metrics.ProcessingLatency.WithLabelValues(contentType).Observe(time.Since(start).Seconds())
 
 			results[i] = resp
 		}(i, logReq)
