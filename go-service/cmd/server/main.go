@@ -50,7 +50,7 @@ func main() {
 	metrics.Init()
 
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery())
+	r.Use(gin.Logger(), gin.Recovery(), api.LoggingMiddleware())
 
 	// Expose Prometheus metrics endpoint
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
@@ -85,4 +85,3 @@ func main() {
 	}
 	log.Println("server stopped")
 }
-

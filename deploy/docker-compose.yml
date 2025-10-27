@@ -67,9 +67,10 @@ services:
       - "8080:8080"
     environment:
       - ELASTICSEARCH_URLS=http://elasticsearch:9200
-      - PYTHON_SERVICE_URL=http://python-service:8000
+      - PYTHON_SERVICE_URL=http://python-service:8001/predict
     depends_on:
       - elasticsearch
+      - python-service
     networks:
       - anomaly-detection
 
@@ -79,7 +80,7 @@ services:
       dockerfile: Dockerfile
     container_name: python-service
     ports:
-      - "8000:8000"
+      - "8001:8001"
     networks:
       - anomaly-detection
 
@@ -100,3 +101,4 @@ volumes:
 networks:
   anomaly-detection:
     driver: bridge
+

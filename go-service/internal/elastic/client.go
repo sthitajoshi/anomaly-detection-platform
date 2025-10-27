@@ -38,10 +38,19 @@ func NewClient(addresses []string) (*Client, error) {
 
 	client := &Client{es: es}
 
-	// Test connection
-	_, err = client.es.Info()
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Elasticsearch: %w", err)
+	// Test connection with a short retry loop
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		_, err = client.es.Info()
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		time.Sleep(time.Duration(200*(1<<i)) * time.Millisecond)
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to connect to Elasticsearch: %w", lastErr)
 	}
 
 	return client, nil
@@ -61,17 +70,25 @@ func (c *Client) IndexLog(ctx context.Context, doc *LogDocument) error {
 		Refresh:    "true",
 	}
 
-	res, err := req.Do(ctx, c.es)
-	if err != nil {
-		return fmt.Errorf("failed to index document: %w", err)
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		res, err := req.Do(ctx, c.es)
+		if err != nil {
+			lastErr = err
+		} else {
+			defer res.Body.Close()
+			if !res.IsError() {
+				return nil
+			}
+			lastErr = fmt.Errorf("Elasticsearch error: %s", res.String())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
+		}
 	}
-	defer res.Body.Close()
-
-	if res.IsError() {
-		return fmt.Errorf("Elasticsearch error: %s", res.String())
-	}
-
-	return nil
+	return lastErr
 }
 
 // SearchLogs searches for logs with optional filters
@@ -86,15 +103,31 @@ func (c *Client) SearchLogs(ctx context.Context, query map[string]interface{}) (
 		Body:  bytes.NewReader(queryBytes),
 	}
 
-	res, err := req.Do(ctx, c.es)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search: %w", err)
+	var res *esapi.Response
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		res, err = req.Do(ctx, c.es)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to search: %w", err)
+		} else if res.IsError() {
+			lastErr = fmt.Errorf("Elasticsearch search error: %s", res.String())
+		} else {
+			lastErr = nil
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
+		}
+	}
+	if lastErr != nil {
+		if res != nil && res.Body != nil {
+			res.Body.Close()
+		}
+		return nil, lastErr
 	}
 	defer res.Body.Close()
-
-	if res.IsError() {
-		return nil, fmt.Errorf("Elasticsearch search error: %s", res.String())
-	}
 
 	var searchResponse struct {
 		Hits struct {
@@ -193,21 +226,29 @@ func (c *Client) CreateIndex(ctx context.Context) error {
 		Body:  strings.NewReader(mapping),
 	}
 
-	res, err := req.Do(ctx, c.es)
-	if err != nil {
-		return fmt.Errorf("failed to create index: %w", err)
-	}
-	defer res.Body.Close()
-
-	if res.IsError() {
-		// Check if index already exists
-		if strings.Contains(res.String(), "resource_already_exists_exception") {
-			return nil
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		res, err := req.Do(ctx, c.es)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to create index: %w", err)
+		} else {
+			defer res.Body.Close()
+			if res.IsError() {
+				if strings.Contains(res.String(), "resource_already_exists_exception") {
+					return nil
+				}
+				lastErr = fmt.Errorf("failed to create index: %s", res.String())
+			} else {
+				return nil
+			}
 		}
-		return fmt.Errorf("failed to create index: %s", res.String())
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
+		}
 	}
-
-	return nil
+	return lastErr
 }
 
 // SearchAnomaliesByText searches for anomalies containing specific text
@@ -313,15 +354,31 @@ func (c *Client) GetAnomalyStats(ctx context.Context, startTime, endTime time.Ti
 		Body:  bytes.NewReader(queryBytes),
 	}
 
-	res, err := req.Do(ctx, c.es)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search: %w", err)
+	var res *esapi.Response
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		res, err = req.Do(ctx, c.es)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to search: %w", err)
+		} else if res.IsError() {
+			lastErr = fmt.Errorf("Elasticsearch search error: %s", res.String())
+		} else {
+			lastErr = nil
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
+		}
+	}
+	if lastErr != nil {
+		if res != nil && res.Body != nil {
+			res.Body.Close()
+		}
+		return nil, lastErr
 	}
 	defer res.Body.Close()
-
-	if res.IsError() {
-		return nil, fmt.Errorf("Elasticsearch search error: %s", res.String())
-	}
 
 	var searchResponse struct {
 		Aggregations struct {
@@ -397,15 +454,31 @@ func (c *Client) GetLogStats(ctx context.Context, startTime, endTime time.Time) 
 		Body:  bytes.NewReader(queryBytes),
 	}
 
-	res, err := req.Do(ctx, c.es)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search: %w", err)
+	var res *esapi.Response
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		res, err = req.Do(ctx, c.es)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to search: %w", err)
+		} else if res.IsError() {
+			lastErr = fmt.Errorf("Elasticsearch search error: %s", res.String())
+		} else {
+			lastErr = nil
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
+		}
+	}
+	if lastErr != nil {
+		if res != nil && res.Body != nil {
+			res.Body.Close()
+		}
+		return nil, lastErr
 	}
 	defer res.Body.Close()
-
-	if res.IsError() {
-		return nil, fmt.Errorf("Elasticsearch search error: %s", res.String())
-	}
 
 	var searchResponse struct {
 		Aggregations struct {
@@ -496,17 +569,26 @@ func (c *Client) BulkPushDetectionResults(ctx context.Context, results []Detecti
 		Refresh: "true",
 	}
 
-	res, err := req.Do(ctx, c.es)
-	if err != nil {
-		return fmt.Errorf("failed to bulk index documents: %w", err)
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		res, err := req.Do(ctx, c.es)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to bulk index documents: %w", err)
+		} else {
+			defer res.Body.Close()
+			if res.IsError() {
+				lastErr = fmt.Errorf("Elasticsearch bulk error: %s", res.String())
+			} else {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
+		}
 	}
-	defer res.Body.Close()
-
-	if res.IsError() {
-		return fmt.Errorf("Elasticsearch bulk error: %s", res.String())
-	}
-
-	return nil
+	return lastErr
 }
 
 // DetectionResult represents a detection result for bulk operations
